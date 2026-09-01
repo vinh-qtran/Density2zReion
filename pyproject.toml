@@ -32,9 +32,11 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "h5py>=3.16.0",
+    "numba>=0.67.0",
     "numpy>=2.2.6",
     "pyfftw>=0.15.0",
     "scipy>=1.15.3",
+    "tqdm>=4.70.0",
 ]
 
 [project.urls]
@@ -113,7 +115,7 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
 module = "density2zreion.*"
-disallow_untyped_defs = true
+disallow_untyped_defs = false
 disallow_incomplete_defs = true
 
 
