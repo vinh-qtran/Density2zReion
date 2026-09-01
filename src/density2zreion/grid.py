@@ -7,6 +7,21 @@ from tqdm import tqdm
 
 class BaseDensityGrid:
     def __init__(self, snapshot_file, grid_file, N_max_load=None, N_cell=None):
+        """
+        Initialize the BaseDensityGrid class for creating a density grid from particle data in a snapshot file.
+
+        Parameters:
+        ----------
+        snapshot_file: str or Path
+            Path to the HDF5 snapshot file containing particle data.
+        grid_file: str or Path
+            Path to the HDF5 file where the density grid will be saved or loaded from.
+        N_max_load: int, optional
+            Maximum number of particles to load at once. If None, all particles will be loaded at once. Default is None.
+        N_cell: int, optional
+            Number of cells along each dimension of the density grid. If None, it will be calculated based on the box size and a default cell size. Default is None.
+        """
+
         self._read_header(snapshot_file)
 
         self._N_max_load = N_max_load or self._N_part
@@ -30,6 +45,15 @@ class BaseDensityGrid:
             self._assign_particles(part_coords, part_masses)
 
     def _read_header(self, snapshot_file):
+        """
+        Read the header information from the snapshot file to extract box size, number of particles, redshift, and time.
+
+        Parameters:
+        ----------
+        snapshot_file: str or Path
+            Path to the HDF5 snapshot file containing particle data.
+        """
+
         with h5py.File(snapshot_file, "r") as f:
             _header = f["Header"]
 
@@ -42,6 +66,17 @@ class BaseDensityGrid:
             self._time = _header.attrs["Time"]
 
     def _load_particles(self, snapshot_file, idx_range):
+        """
+        Load particle coordinates and masses from the snapshot file for a given index range.
+
+        Parameters:
+        ----------
+        snapshot_file: str or Path
+            Path to the HDF5 snapshot file containing particle data.
+        idx_range: slice
+            Slice object specifying the range of particle indices to load.
+        """
+
         with h5py.File(snapshot_file, "r") as f:
             _h = f["Header"].attrs.get("HubbleParam", 1.0)
 
@@ -52,6 +87,22 @@ class BaseDensityGrid:
         return part_coords, part_masses
 
     def _get_grid(self, grid_file):
+        """
+        Get the initial grid and total number of particles from a grid file. If the grid file does not exist, it initializes an empty grid and sets the total number of particles to zero.
+
+        Parameters:
+        ----------
+        grid_file: str or Path
+            Path to the HDF5 grid file.
+
+        Returns:
+        -------
+        grid: np.ndarray
+            The initial density grid.
+        N_part_total: int
+            The total number of particles in the grid.
+        """
+
         if os.path.exists(grid_file):  # noqa: PTH110
             with h5py.File(grid_file, "r") as f:
                 grid = f["DensityDM"][:]
@@ -65,10 +116,30 @@ class BaseDensityGrid:
         return grid, N_part_total
 
     def _assign_particles(self, part_coords, part_masses):
+        """
+        Assign particles to the density grid based on their coordinates and masses. This method should be implemented in subclasses to define specific assignment schemes (e.g., NGP, CIC).
+
+        Parameters:
+        ----------
+        part_coords: np.ndarray
+            Array of particle coordinates.
+        part_masses: np.ndarray
+            Array of particle masses.
+        """
+
         _msg = "Not implemented in base class."
         raise NotImplementedError(_msg)
 
     def save_grid(self, grid_file):
+        """
+        Save the current density grid to an HDF5 file.
+
+        Parameters:
+        ----------
+        grid_file: str or Path
+            Path to the HDF5 grid file.
+        """
+
         with h5py.File(grid_file, "w") as f:
             _header = f.create_group("Header")
 
@@ -87,6 +158,17 @@ class NGPDensityGrid(BaseDensityGrid):
         super().__init__(*args, **kwargs)
 
     def _assign_particles(self, part_coords, part_masses):
+        """
+        Assign particles to the density grid using the Nearest Grid Point (NGP) method.
+
+        Parameters:
+        ----------
+        part_coords: np.ndarray
+            Array of particle coordinates.
+        part_masses: np.ndarray
+            Array of particle masses.
+        """
+
         _part_densities = part_masses / self._cell_size**3
 
         _norm_part_coords = part_coords / self._cell_size - 0.5
@@ -108,6 +190,17 @@ class CICDensityGrid(BaseDensityGrid):
         super().__init__(*args, **kwargs)
 
     def _assign_particles(self, part_coords, part_masses):
+        """
+        Assign particles to the density grid using the Cloud-In-Cell (CIC) method.
+
+        Parameters:
+        ----------
+        part_coords: np.ndarray
+            Array of particle coordinates.
+        part_masses: np.ndarray
+            Array of particle masses.
+        """
+
         _part_densities = part_masses / self._cell_size**3
 
         _norm_part_coords = part_coords / self._cell_size - 0.5
