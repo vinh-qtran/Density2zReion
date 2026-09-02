@@ -6,31 +6,31 @@ from tqdm import tqdm
 
 
 class BaseDensityGrid:
-    def __init__(self, snapshot_file, grid_file, N_max_load=None, N_cell=None):
+    def __init__(self, sim_file, grid_file, N_cell=None, N_max_load=None):
         """
-        Initialize the BaseDensityGrid class for creating a density grid from particle data in a snapshot file.
+        Initialize the BaseDensityGrid class for creating a density grid from particle data in a simulation file.
 
         Parameters:
         ----------
-        snapshot_file: str or Path
-            Path to the HDF5 snapshot file containing particle data.
+        sim_file: str or Path
+            Path to the HDF5 simulation file containing particle data.
         grid_file: str or Path
             Path to the HDF5 file where the density grid will be saved or loaded from.
-        N_max_load: int, optional
-            Maximum number of particles to load at once. If None, all particles will be loaded at once. Default is None.
         N_cell: int, optional
             Number of cells along each dimension of the density grid. If None, it will be calculated based on the box size and a default cell size. Default is None.
+        N_max_load: int, optional
+            Maximum number of particles to load at once. If None, all particles will be loaded at once. Default is None.
         """
 
-        self._read_header(snapshot_file)
+        self._read_header(sim_file)
 
-        self._N_max_load = N_max_load or self._N_part
-
-        self._N_cell = N_cell or np.round(self._box_size / (np.pi * 1e3)).astype(int)
+        self._N_cell = N_cell or np.round(self._box_size / np.pi).astype(int)
         self._cell_size = self._box_size / self._N_cell
 
         self._grid, self._N_part_total = self._get_grid(grid_file)
         self._N_part_total += self._N_part
+
+        self._N_max_load = N_max_load or self._N_part
 
         for i in tqdm(
             range(np.ceil(self._N_part / self._N_max_load).astype(int)),
@@ -40,49 +40,49 @@ class BaseDensityGrid:
             _idx_end = min((i + 1) * self._N_max_load, self._N_part)
 
             part_coords, part_masses = self._load_particles(
-                snapshot_file, slice(_idx_start, _idx_end)
+                sim_file, slice(_idx_start, _idx_end)
             )
             self._assign_particles(part_coords, part_masses)
 
-    def _read_header(self, snapshot_file):
+    def _read_header(self, sim_file):
         """
         Read the header information from the snapshot file to extract box size, number of particles, redshift, and time.
 
         Parameters:
         ----------
-        snapshot_file: str or Path
-            Path to the HDF5 snapshot file containing particle data.
+        sim_file: str or Path
+            Path to the HDF5 simulation file containing particle data.
         """
 
-        with h5py.File(snapshot_file, "r") as f:
+        with h5py.File(sim_file, "r") as f:
             _header = f["Header"]
 
             _h = _header.attrs.get("HubbleParam", 1.0)
 
-            self._box_size = _header.attrs["BoxSize"] / _h
+            self._box_size = _header.attrs["BoxSize"] / _h / 1e3
             self._N_part = _header.attrs["NumPart_ThisFile"][1]
 
             self._z = _header.attrs["Redshift"]
             self._time = _header.attrs["Time"]
 
-    def _load_particles(self, snapshot_file, idx_range):
+    def _load_particles(self, sim_file, idx_range):
         """
-        Load particle coordinates and masses from the snapshot file for a given index range.
+        Load particle coordinates and masses from the simulation file for a given index range.
 
         Parameters:
         ----------
-        snapshot_file: str or Path
-            Path to the HDF5 snapshot file containing particle data.
+        sim_file: str or Path
+            Path to the HDF5 simulation file containing particle data.
         idx_range: slice
             Slice object specifying the range of particle indices to load.
         """
 
-        with h5py.File(snapshot_file, "r") as f:
+        with h5py.File(sim_file, "r") as f:
             _h = f["Header"].attrs.get("HubbleParam", 1.0)
 
-            part_coords = f["PartType1"]["Coordinates"][idx_range] / _h
-            part_masses = f["Header"].attrs["MassTable"][1] / _h
-            part_masses = part_masses or f["PartType1"]["Masses"][idx_range] * 1e10 / _h
+            part_coords = f["PartType1"]["Coordinates"][idx_range] / _h / 1e3
+            part_masses = f["Header"].attrs["MassTable"][1] / _h * 1e10
+            part_masses = part_masses or f["PartType1"]["Masses"][idx_range] / _h * 1e10
 
         return part_coords, part_masses
 

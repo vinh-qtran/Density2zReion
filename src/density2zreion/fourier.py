@@ -127,9 +127,9 @@ class FourierTransform:
         self._box_size = box_size
         self._N_cell = N_cell
 
-        self.dx = box_size / N_cell
-        self.k_min = 2 * np.pi / box_size
-        self.k_max = np.pi / self.dx
+        self._dx = box_size / N_cell
+        self._k_min = 2 * np.pi / box_size
+        self._k_max = np.pi / self._dx
 
     def get_fourier_transform(self, delta_x):
         """
@@ -164,7 +164,7 @@ class FourierTransform:
 
         return k_mag, delta_k
 
-    def inv_fourier_transform(self, delta_k):
+    def get_inv_fourier_transform(self, delta_k):
         """
         Perform the inverse Fourier transform to get back the field in real space from its Fourier transform.
 
@@ -189,7 +189,7 @@ class FourierTransform:
 
         return self._fftw_inverse.output_array.copy()
 
-    def get_conv_kernels(self, p=2, dx=None):
+    def get_conv_kernel(self, p=2, dx=None):
         """
         Get the convolution kernels for the Fourier transform, which includes both the shot noise correction and the deconvolution kernel for the mass assignment scheme.
 
