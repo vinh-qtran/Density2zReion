@@ -151,8 +151,14 @@ def _get_fourier_transform(box_size, N_cell):
 def _get_density_grid(grid_file):
     with h5py.File(grid_file, "r") as f:
         box_size = f["Header"].attrs["BoxSize"]
-        N_cell = f["Header"].attrs["NumCells"]
         cell_size = f["Header"].attrs["CellSize"]
+
+        N_cell = (
+            f["Header"].attrs["NumCells"]
+            if "NumCells" in f["Header"].attrs
+            else box_size / cell_size
+        )
+
         a = f["Header"].attrs["Time"]
 
         _rho_grid = f["DensityDM"][:].astype(np.float64)
