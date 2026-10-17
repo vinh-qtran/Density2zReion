@@ -150,15 +150,6 @@ def _get_fourier_transform(box_size, N_cell):
 
 def _get_density_grid(grid_file):
     with h5py.File(grid_file, "r") as f:
-        box_size = f["Header"].attrs["BoxSize"]
-        cell_size = f["Header"].attrs["CellSize"]
-
-        N_cell = (
-            f["Header"].attrs["NumCells"]
-            if "NumCells" in f["Header"].attrs
-            else box_size / cell_size
-        )
-
         a = f["Header"].attrs["Time"]
 
         _rho_grid = f["DensityDM"][:].astype(np.float64)
@@ -167,7 +158,7 @@ def _get_density_grid(grid_file):
         delta_m_x = _rho_grid / _rho_mean - 1
         del _rho_grid, _rho_mean
 
-    return delta_m_x, box_size, N_cell, cell_size, a
+    return delta_m_x, a
 
 
 def _get_power_spectrum_scaler(a, z_reion_params, cosmology_params):
@@ -184,6 +175,19 @@ def _get_power_spectrum_scaler(a, z_reion_params, cosmology_params):
     return _D(_a_z_reion_mean) / _D(a)
 
 
+def _get_density_dm_fourier(
+    density_grid_file, fourier_transform, z_reion_params, cosmology_params
+):
+    _delta_m_x, _a = _get_density_grid(density_grid_file)
+
+    _k_mag, _delta_m_k = fourier_transform.get_fourier_transform(_delta_m_x)
+    del _delta_m_x
+
+    _delta_m_k *= _get_power_spectrum_scaler(_a, z_reion_params, cosmology_params)
+
+    return _k_mag, _delta_m_k
+
+
 def _get_z_reion_fourier(k_mag, delta_m_k, z_reion_params):
     return delta_m_k * _get_bias_factor(
         k_mag.ravel(),
@@ -196,10 +200,18 @@ def _get_z_reion_fourier(k_mag, delta_m_k, z_reion_params):
 def density_to_z_reion(
     density_grid_file,
     z_reion_grid_file,
+    grid_params=None,
     save_files=None,
     z_reion_params=None,
     cosmology_params=None,
 ):
+    _grid_params = {
+        "box_size": 500,
+        "N_cell": 320,
+        "cell_size": 500 / 320,
+        **(grid_params or {}),
+    }
+
     _save_files = {
         "density_fourier_file": None,
         "conv_kernel_Ncell_file": None,
@@ -222,13 +234,10 @@ def density_to_z_reion(
         **(cosmology_params or {}),
     }
 
-    # Get the density grid and its properties
-    _delta_m_x, _box_size, _N_cell, _cell_size, _a = _get_density_grid(
-        density_grid_file,
-    )
-
     # Get the Fourier transform utils
-    _fourier_transform = _get_fourier_transform(_box_size, _N_cell)
+    _fourier_transform = _get_fourier_transform(
+        _grid_params["box_size"], _grid_params["N_cell"]
+    )
 
     # Get the reionization redshift in Fourier space
     if not check_file_exists(_save_files["z_reion_fourier_file"]):
@@ -239,22 +248,22 @@ def density_to_z_reion(
                 "WaveVector": np.float64,
                 "DensityDMFourier": np.complex128,
             },
-            func=_fourier_transform.get_fourier_transform,
-            delta_x=_delta_m_x,
+            func=_get_density_dm_fourier,
+            density_grid_file=density_grid_file,
+            fourier_transform=_fourier_transform,
+            z_reion_params=_z_reion_params,
+            cosmology_params=_cosmology_params,
         )
-        del _delta_m_x
-
-        _delta_m_k *= _get_power_spectrum_scaler(_a, _z_reion_params, _cosmology_params)
 
         # Apply convolution kernels if needed
-        if _cell_size < np.pi:
+        if _grid_params["cell_size"] < np.pi:
             _conv_kernel_Ncell = load_or_compute(
                 save_file=_save_files["conv_kernel_Ncell_file"],
                 datasets={
                     "ConvKernelNcell": np.complex128,
                 },
                 func=_fourier_transform.get_conv_kernel,
-                dx=_cell_size,
+                dx=_grid_params["cell_size"],
             )[0]
             _delta_m_k /= _conv_kernel_Ncell
             del _conv_kernel_Ncell
@@ -288,8 +297,6 @@ def density_to_z_reion(
         with h5py.File(_save_files["z_reion_fourier_file"], "r") as f:
             _delta_z_k = f["ReionizationRedshiftFourier"][:]
 
-        del _delta_m_x
-
     # Get the reionization redshift in real space
     _delta_z_x = _fourier_transform.get_inv_fourier_transform(_delta_z_k)
     del _delta_z_k
@@ -301,8 +308,8 @@ def density_to_z_reion(
     with h5py.File(z_reion_grid_file, "w") as f:
         _header = f.create_group("Header")
 
-        _header.attrs.create("BoxSize", _box_size, dtype=np.float64)
-        _header.attrs.create("NumCells", _N_cell, dtype=np.int32)
-        _header.attrs.create("CellSize", _cell_size, dtype=np.float64)
+        _header.attrs.create("BoxSize", _grid_params["box_size"], dtype=np.float64)
+        _header.attrs.create("NumCells", _grid_params["N_cell"], dtype=np.int32)
+        _header.attrs.create("CellSize", _grid_params["cell_size"], dtype=np.float64)
 
         f.create_dataset("ReionizationRedshift", data=_z_reion_grid, dtype=np.float64)
