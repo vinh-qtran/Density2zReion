@@ -44,6 +44,7 @@ def load_or_compute(save_file, datasets, func, *args, **kwargs):
 
     out = func(*args, **kwargs)
     out = out if isinstance(out, tuple) else (out,)
+
     if save_file is not None:
         with h5py.File(save_file, "w") as _f:
             for (_field_name, _dtype), _data in zip(datasets.items(), out, strict=True):

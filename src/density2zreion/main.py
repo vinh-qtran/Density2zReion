@@ -260,7 +260,7 @@ def density_to_z_reion(
             _conv_kernel_Ncell = load_or_compute(
                 save_file=_save_files["conv_kernel_Ncell_file"],
                 datasets={
-                    "ConvKernelNcell": np.complex128,
+                    "ConvKernelNcell": np.float64,
                 },
                 func=_fourier_transform.get_conv_kernel,
                 dx=_grid_params["cell_size"],
@@ -271,7 +271,7 @@ def density_to_z_reion(
             _conv_kernel_Mpc = load_or_compute(
                 save_file=_save_files["conv_kernel_Mpc_file"],
                 datasets={
-                    "ConvKernelMpc": np.complex128,
+                    "ConvKernelMpc": np.float64,
                 },
                 func=_fourier_transform.get_conv_kernel,
                 dx=np.pi,
