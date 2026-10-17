@@ -177,7 +177,7 @@ def _get_power_spectrum_scaler(a, z_reion_params, cosmology_params):
 
     _a_z_reion_mean = 1 / (1 + z_reion_params["z_reion_mean"])
 
-    return (_D(_a_z_reion_mean) / _D(a)) ** 2
+    return _D(_a_z_reion_mean) / _D(a)
 
 
 def density_to_z_reion(
@@ -243,7 +243,7 @@ def density_to_z_reion(
                 },
                 func=_fourier_transform.get_conv_kernel,
                 dx=_cell_size,
-            )
+            )[0]
             _delta_m_k /= _conv_kernel_Ncell
             del _conv_kernel_Ncell
 
@@ -254,7 +254,7 @@ def density_to_z_reion(
                 },
                 func=_fourier_transform.get_conv_kernel,
                 dx=np.pi,
-            )
+            )[0]
             _delta_m_k *= _conv_kernel_Mpc
             del _conv_kernel_Mpc
 
