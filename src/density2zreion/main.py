@@ -2,12 +2,12 @@ import os
 
 import h5py
 import numpy as np
+import pyfftw
 from numba import njit, prange
 from scipy.special import hyp2f1
+from tqdm import tqdm
 
-from density2zreion.fourier import FFTWPlan, FourierTransform
 from density2zreion.grid import CICDensityGrid
-from density2zreion.utils import check_file_exists, load_or_compute
 
 
 def _get_all_simulation_files(sim_dir, file_base):
@@ -102,15 +102,15 @@ def particles_to_grid(sim_dir, file_base, grid_file, N_cell=None, N_max_load=Non
         os.rename(_processed_file, grid_file)  # noqa: PTH104
 
 
-@njit(parallel=True)
+@njit
 def _get_bias_factor(k_mag, b0=0.704, k0=0.0789, alpha=0.419, beta=2):
     """
     Compute the bias factor for a given k magnitude.
 
     Parameters:
     ----------
-    k_mag: array
-        Array of k magnitudes.
+    k_mag: float
+        Magnitude of the wavevector.
     b0: float
         Bias factor at k=0. Default is 0.704.
     k0: float
@@ -122,46 +122,203 @@ def _get_bias_factor(k_mag, b0=0.704, k0=0.0789, alpha=0.419, beta=2):
 
     Returns:
     -------
-    b_k: array
-        Array of bias factors corresponding to the input k magnitudes.
+    b_k: float
+        Bias factor corresponding to the input k magnitude.
     """
 
-    _n = k_mag.size
-    b_k = np.empty(_n)
-
-    for i in prange(_n):
-        b_k[i] = b0 / (1 + (k_mag[i] / k0) ** beta) ** (alpha / beta)
-
-    return b_k
+    return b0 / (1 + (k_mag / k0) ** beta) ** (alpha / beta)
 
 
-def _get_fourier_transform(box_size, N_cell, fftw_effort):
-    _fftw_plan = FFTWPlan(N_cell=N_cell, fftw_effort=fftw_effort)
-    _fftw_forward = _fftw_plan.build_forward_plan()
-    _fftw_inverse = _fftw_plan.build_inverse_plan()
+@njit(parallel=True)
+def _get_overdensity(rho_x, rho_mean):
+    """
+    Convert a density grid to an overdensity grid in place, delta = rho / rho_mean - 1.
 
-    return FourierTransform(
-        box_size=box_size,
-        N_cell=N_cell,
-        fftw_forward=_fftw_forward,
-        fftw_inverse=_fftw_inverse,
+    Parameters:
+    ----------
+    rho_x: 3D array
+        Density grid in real space. Overwritten with the overdensity.
+    rho_mean: float
+        Mean density of the grid.
+    """
+
+    _N_x, _N_y, _N_z = rho_x.shape
+
+    for i in prange(_N_x):
+        for j in range(_N_y):
+            for k in range(_N_z):
+                rho_x[i, j, k] = rho_x[i, j, k] / rho_mean - 1
+
+
+@njit(parallel=True)
+def _apply_fourier_filter(
+    delta_k, k_xy_1d, k_z_1d, w_xy_1d, w_z_1d, scaler, b0, k0, alpha, beta
+):
+    """
+    Multiply the Fourier-space density field in place by the total filter
+    F(k) = scaler * W(kx) * W(ky) * W(kz) * b(|k|), computed on the fly.
+
+    Parameters:
+    ----------
+    delta_k: 3D complex array
+        Density field in Fourier space, of shape (N_cell, N_cell, N_cell//2 + 1). Overwritten with the reionization redshift field in Fourier space.
+    k_xy_1d: 1D array
+        Wavenumbers along the x and y axes.
+    k_z_1d: 1D array
+        Wavenumbers along the z axis (half-space).
+    w_xy_1d: 1D array
+        Separable convolution kernel ratio along the x and y axes.
+    w_z_1d: 1D array
+        Separable convolution kernel ratio along the z axis.
+    scaler: float
+        Linear growth factor ratio D(z_reion_mean) / D(z).
+    b0, k0, alpha, beta: float
+        Bias factor parameters, see _get_bias_factor.
+    """
+
+    _N_x, _N_y, _N_z = delta_k.shape
+
+    for i in prange(_N_x):
+        for j in range(_N_y):
+            for k in range(_N_z):
+                _k_mag = np.sqrt(k_xy_1d[i] ** 2 + k_xy_1d[j] ** 2 + k_z_1d[k] ** 2)
+
+                delta_k[i, j, k] *= (
+                    scaler
+                    * w_xy_1d[i]
+                    * w_xy_1d[j]
+                    * w_z_1d[k]
+                    * _get_bias_factor(_k_mag, b0, k0, alpha, beta)
+                )
+
+
+@njit(parallel=True)
+def _get_z_reion(delta_z_x, z_reion_mean):
+    """
+    Convert the reionization redshift fluctuation to the reionization redshift in place, z_reion = delta_z * (1 + z_reion_mean) + z_reion_mean.
+
+    Parameters:
+    ----------
+    delta_z_x: 3D array
+        Reionization redshift fluctuation in real space. Overwritten with the reionization redshift.
+    z_reion_mean: float
+        Mean reionization redshift.
+    """
+
+    _N_x, _N_y, _N_z = delta_z_x.shape
+
+    for i in prange(_N_x):
+        for j in range(_N_y):
+            for k in range(_N_z):
+                delta_z_x[i, j, k] = (
+                    delta_z_x[i, j, k] * (1 + z_reion_mean) + z_reion_mean
+                )
+
+
+def _get_inplace_fftw(N_cell, fftw_effort, double_precision, n_threads=None):
+    """
+    Allocate a single padded buffer and build in-place real-to-complex FFTW plans on it. The buffer has shape (N_cell, N_cell, 2 * (N_cell//2 + 1)), so that the N_cell^3 real field and its N_cell^2 * (N_cell//2 + 1) complex transform share the same memory.
+
+    The plans are built while the buffer is still empty, so FFTW_MEASURE and higher efforts are safe to use (they overwrite the buffer while planning).
+
+    Parameters:
+    ----------
+    N_cell: int
+        Number of cells in each dimension.
+    fftw_effort: str
+        Effort level for the FFTW planner.
+    double_precision: bool
+        Whether to use float64/complex128 (True) or float32/complex64 (False).
+    n_threads: int, optional
+        Number of threads for FFTW. If None, it will use the number of CPU cores available.
+
+    Returns:
+    -------
+    field_x: 3D array
+        Real-space view of the buffer, of shape (N_cell, N_cell, N_cell).
+    field_k: 3D complex array
+        Fourier-space view of the buffer, of shape (N_cell, N_cell, N_cell//2 + 1).
+    fftw_forward: pyfftw.FFTW
+        In-place forward plan, field_x -> field_k.
+    fftw_inverse: pyfftw.FFTW
+        In-place inverse plan, field_k -> field_x, normalized by 1/N_cell^3.
+    """
+
+    _real_dtype = np.float64 if double_precision else np.float32
+    _complex_dtype = np.complex128 if double_precision else np.complex64
+    _n_threads = n_threads or os.cpu_count()
+
+    _buffer = pyfftw.empty_aligned(
+        (N_cell, N_cell, 2 * (N_cell // 2 + 1)), dtype=_real_dtype
+    )
+    field_x = _buffer[..., :N_cell]
+    field_k = _buffer.view(_complex_dtype)
+
+    fftw_forward = pyfftw.FFTW(
+        field_x,
+        field_k,
+        axes=(0, 1, 2),
+        direction="FFTW_FORWARD",
+        flags=(fftw_effort,),
+        threads=_n_threads,
+    )
+    fftw_inverse = pyfftw.FFTW(
+        field_k,
+        field_x,
+        axes=(0, 1, 2),
+        direction="FFTW_BACKWARD",
+        flags=(fftw_effort,),
+        threads=_n_threads,
+        normalise_idft=True,
     )
 
+    return field_x, field_k, fftw_forward, fftw_inverse
 
-def _get_density_grid(grid_file):
+
+def _load_density_grid(grid_file, field_x, N_slab):
+    """
+    Load the density grid into the real-space buffer slab by slab, and return the scale factor and mean density.
+
+    Parameters:
+    ----------
+    grid_file: str or Path
+        Path to the HDF5 density grid file.
+    field_x: 3D array
+        Real-space view of the buffer to load the density into.
+    N_slab: int
+        Number of x-planes to load at a time.
+
+    Returns:
+    -------
+    a: float
+        Scale factor of the snapshot.
+    rho_mean: float
+        Mean density of the grid.
+    """
+
+    _N_cell = field_x.shape[0]
+
     with h5py.File(grid_file, "r") as f:
         a = f["Header"].attrs["Time"]
 
-        _rho_grid = f["DensityDM"][:].astype(np.float64)
-        _rho_mean = np.mean(_rho_grid)
+        _dset = f["DensityDM"]
+        if _dset.shape != field_x.shape:
+            _msg = f"DensityDM has shape {_dset.shape}, expected {field_x.shape} from grid_params."
+            raise ValueError(_msg)
 
-        delta_m_x = _rho_grid / _rho_mean - 1
-        del _rho_grid, _rho_mean
+        _rho_sum = 0.0
+        for i in tqdm(range(0, _N_cell, N_slab), desc="Loading density"):
+            field_x[i : i + N_slab] = _dset[i : i + N_slab]
+            _rho_sum += np.sum(field_x[i : i + N_slab], dtype=np.float64)
 
-    return delta_m_x, a
+    return a, _rho_sum / _N_cell**3
 
 
-def _get_power_spectrum_scaler(a, z_reion_params, cosmology_params):
+def _get_growth_factor_ratio(a, z_reion_params, cosmology_params):
+    """
+    Linear growth factor ratio D(z_reion_mean) / D(a), which rescales the density field (not its power spectrum) from the snapshot to the mean reionization redshift.
+    """
+
     def _D(a):
         return a * hyp2f1(
             1 / 3,
@@ -175,37 +332,67 @@ def _get_power_spectrum_scaler(a, z_reion_params, cosmology_params):
     return _D(_a_z_reion_mean) / _D(a)
 
 
-def _get_density_dm_fourier(
-    density_grid_file, fourier_transform, z_reion_params, cosmology_params
-):
-    _delta_m_x, _a = _get_density_grid(density_grid_file)
+def _get_conv_kernel_ratio_1d(k_1d, cell_size, p=2):
+    """
+    Separable 1D ratio of the mass assignment kernels, W_pi(k) / W_cell(k), that deconvolves the CIC assignment at the grid cell size and re-smooths to pi cMpc. Returns ones if the cell size is not smaller than pi.
 
-    _k_mag, _delta_m_k = fourier_transform.get_fourier_transform(_delta_m_x)
-    del _delta_m_x
+    Parameters:
+    ----------
+    k_1d: 1D array
+        Wavenumbers along one axis.
+    cell_size: float
+        Grid cell size.
+    p: int, optional
+        Order of the mass assignment scheme. Default is 2 (CIC).
 
-    _delta_m_k *= _get_power_spectrum_scaler(_a, z_reion_params, cosmology_params)
+    Returns:
+    -------
+    w_1d: 1D array
+        Kernel ratio along this axis.
+    """
 
-    return _k_mag, _delta_m_k
+    if cell_size >= np.pi:
+        return np.ones_like(k_1d)
 
+    def _single_conv_kernel(dx):
+        return np.sinc(k_1d * dx / (2 * np.pi)) ** p
 
-def _get_z_reion_fourier(k_mag, delta_m_k, z_reion_params):
-    return delta_m_k * _get_bias_factor(
-        k_mag.ravel(),
-        b0=z_reion_params["b0"],
-        k0=z_reion_params["k0"],
-        alpha=z_reion_params["alpha"],
-    ).reshape(k_mag.shape)
+    return _single_conv_kernel(np.pi) / _single_conv_kernel(cell_size)
 
 
 def density_to_z_reion(
     density_grid_file,
     z_reion_grid_file,
     grid_params=None,
-    save_files=None,
     z_reion_params=None,
     cosmology_params=None,
     fftw_effort="FFTW_ESTIMATE",
+    double_precision=True,
+    N_slab=64,
 ):
+    """
+    Convert a density grid to a reionization redshift grid, working in place on a single padded buffer. Peak memory is about one N_cell^3 array (8 bytes per cell in double precision, 4 in single) plus one slab of N_slab x-planes.
+
+    Parameters:
+    ----------
+    density_grid_file: str or Path
+        Path to the HDF5 density grid file.
+    z_reion_grid_file: str or Path
+        Path to the output HDF5 reionization redshift grid file.
+    grid_params: dict, optional
+        Grid parameters: box_size, N_cell, cell_size.
+    z_reion_params: dict, optional
+        Reionization parameters: b0, k0, alpha, beta, z_reion_mean.
+    cosmology_params: dict, optional
+        Cosmology parameters: Omega_m, Omega_L.
+    fftw_effort: str, optional
+        Effort level for the FFTW planner. Default is "FFTW_ESTIMATE".
+    double_precision: bool, optional
+        Whether to work in float64 (True) or float32 (False). Default is True.
+    N_slab: int, optional
+        Number of x-planes read or written at a time. Default is 64.
+    """
+
     _grid_params = {
         "box_size": 500,
         "N_cell": 320,
@@ -213,18 +400,11 @@ def density_to_z_reion(
         **(grid_params or {}),
     }
 
-    _save_files = {
-        "density_fourier_file": None,
-        "conv_kernel_Ncell_file": None,
-        "conv_kernel_Mpc_file": None,
-        "z_reion_fourier_file": None,
-        **(save_files or {}),
-    }
-
     _z_reion_params = {
         "b0": 0.704,
         "k0": 0.0789,
         "alpha": 0.419,
+        "beta": 2,
         "z_reion_mean": 7.2,
         **(z_reion_params or {}),
     }
@@ -235,82 +415,55 @@ def density_to_z_reion(
         **(cosmology_params or {}),
     }
 
-    # Get the Fourier transform utils
-    _fourier_transform = _get_fourier_transform(
-        _grid_params["box_size"], _grid_params["N_cell"], fftw_effort=fftw_effort
+    _N_cell = _grid_params["N_cell"]
+    _cell_size = _grid_params["cell_size"]
+
+    # Allocate the buffer and build the FFTW plans (before loading any data)
+    _field_x, _field_k, _fftw_forward, _fftw_inverse = _get_inplace_fftw(
+        _N_cell, fftw_effort=fftw_effort, double_precision=double_precision
     )
 
-    # Get the reionization redshift in Fourier space
-    if not check_file_exists(_save_files["z_reion_fourier_file"]):
-        # Get the density grid in Fourier space
-        _k_mag, _delta_m_k = load_or_compute(
-            save_file=_save_files["density_fourier_file"],
-            datasets={
-                "WaveVector": np.float64,
-                "DensityDMFourier": np.complex128,
-            },
-            func=_get_density_dm_fourier,
-            density_grid_file=density_grid_file,
-            fourier_transform=_fourier_transform,
-            z_reion_params=_z_reion_params,
-            cosmology_params=_cosmology_params,
-        )
+    # Load the density grid and convert it to overdensity in place
+    _a, _rho_mean = _load_density_grid(density_grid_file, _field_x, N_slab)
+    _get_overdensity(_field_x, _rho_mean)
 
-        # Apply convolution kernels if needed
-        if _grid_params["cell_size"] < np.pi:
-            _conv_kernel_Ncell = load_or_compute(
-                save_file=_save_files["conv_kernel_Ncell_file"],
-                datasets={
-                    "ConvKernelNcell": np.float64,
-                },
-                func=_fourier_transform.get_conv_kernel,
-                dx=_grid_params["cell_size"],
-            )[0]
-            _delta_m_k /= _conv_kernel_Ncell
-            del _conv_kernel_Ncell
+    # Get the density grid in Fourier space
+    _fftw_forward()
 
-            _conv_kernel_Mpc = load_or_compute(
-                save_file=_save_files["conv_kernel_Mpc_file"],
-                datasets={
-                    "ConvKernelMpc": np.float64,
-                },
-                func=_fourier_transform.get_conv_kernel,
-                dx=np.pi,
-            )[0]
-            _delta_m_k *= _conv_kernel_Mpc
-            del _conv_kernel_Mpc
+    # Apply growth rescaling, convolution kernels and bias in one pass
+    _k_xy_1d = np.fft.fftfreq(_N_cell, d=_cell_size) * 2 * np.pi
+    _k_z_1d = np.fft.rfftfreq(_N_cell, d=_cell_size) * 2 * np.pi
 
-        # Get the reionization redshift in Fourier space
-        _delta_z_k = load_or_compute(
-            save_file=_save_files["z_reion_fourier_file"],
-            datasets={
-                "ReionizationRedshiftFourier": np.complex128,
-            },
-            func=_get_z_reion_fourier,
-            k_mag=_k_mag,
-            delta_m_k=_delta_m_k,
-            z_reion_params=_z_reion_params,
-        )[0]
-        del _k_mag, _delta_m_k
-
-    else:
-        # Get the reionization redshift in Fourier space
-        with h5py.File(_save_files["z_reion_fourier_file"], "r") as f:
-            _delta_z_k = f["ReionizationRedshiftFourier"][:]
+    _apply_fourier_filter(
+        _field_k,
+        _k_xy_1d,
+        _k_z_1d,
+        _get_conv_kernel_ratio_1d(_k_xy_1d, _cell_size),
+        _get_conv_kernel_ratio_1d(_k_z_1d, _cell_size),
+        _get_growth_factor_ratio(_a, _z_reion_params, _cosmology_params),
+        _z_reion_params["b0"],
+        _z_reion_params["k0"],
+        _z_reion_params["alpha"],
+        _z_reion_params["beta"],
+    )
 
     # Get the reionization redshift in real space
-    _delta_z_x = _fourier_transform.get_inv_fourier_transform(_delta_z_k)
-    del _delta_z_k
-
-    _z_reion_mean = _z_reion_params["z_reion_mean"]
-    _z_reion_grid = _delta_z_x * (1 + _z_reion_mean) + _z_reion_mean
-    del _delta_z_x
+    _fftw_inverse()
+    _get_z_reion(_field_x, _z_reion_params["z_reion_mean"])
 
     with h5py.File(z_reion_grid_file, "w") as f:
         _header = f.create_group("Header")
 
         _header.attrs.create("BoxSize", _grid_params["box_size"], dtype=np.float64)
-        _header.attrs.create("NumCells", _grid_params["N_cell"], dtype=np.int32)
-        _header.attrs.create("CellSize", _grid_params["cell_size"], dtype=np.float64)
+        _header.attrs.create("NumCells", _N_cell, dtype=np.int32)
+        _header.attrs.create("CellSize", _cell_size, dtype=np.float64)
+        for _key, _value in _z_reion_params.items():
+            _header.attrs[_key] = _value
 
-        f.create_dataset("ReionizationRedshift", data=_z_reion_grid, dtype=np.float64)
+        _dset = f.create_dataset(
+            "ReionizationRedshift",
+            shape=_field_x.shape,
+            dtype=_field_x.dtype,
+        )
+        for i in tqdm(range(0, _N_cell, N_slab), desc="Saving z_reion"):
+            _dset[i : i + N_slab] = _field_x[i : i + N_slab]
