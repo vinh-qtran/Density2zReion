@@ -47,4 +47,5 @@ def load_or_compute(save_file, datasets, func, *args, **kwargs):
         with h5py.File(save_file, "w") as _f:
             for (_field_name, _dtype), _data in zip(datasets.items(), out, strict=True):
                 _f.create_dataset(_field_name, data=_data, dtype=_dtype)
-    return out
+
+    return out if isinstance(out, tuple) else (out,)
