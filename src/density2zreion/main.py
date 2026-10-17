@@ -135,8 +135,8 @@ def _get_bias_factor(k_mag, b0=0.704, k0=0.0789, alpha=0.419, beta=2):
     return b_k
 
 
-def _get_fourier_transform(box_size, N_cell):
-    _fftw_plan = FFTWPlan(N_cell=N_cell)
+def _get_fourier_transform(box_size, N_cell, fftw_effort):
+    _fftw_plan = FFTWPlan(N_cell=N_cell, fftw_effort=fftw_effort)
     _fftw_forward = _fftw_plan.build_forward_plan()
     _fftw_inverse = _fftw_plan.build_inverse_plan()
 
@@ -204,6 +204,7 @@ def density_to_z_reion(
     save_files=None,
     z_reion_params=None,
     cosmology_params=None,
+    fftw_effort="FFTW_ESTIMATE",
 ):
     _grid_params = {
         "box_size": 500,
@@ -236,7 +237,7 @@ def density_to_z_reion(
 
     # Get the Fourier transform utils
     _fourier_transform = _get_fourier_transform(
-        _grid_params["box_size"], _grid_params["N_cell"]
+        _grid_params["box_size"], _grid_params["N_cell"], fftw_effort=fftw_effort
     )
 
     # Get the reionization redshift in Fourier space
