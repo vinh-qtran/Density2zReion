@@ -1,11 +1,10 @@
 import os
 
-import h5py
 import numpy as np
-from scipy.special import hyp2f1
 
 from density2zreion.fourier import FourierField
 from density2zreion.grid import CICDensityGrid
+from density2zreion.utils import get_grid_time, get_growth_factor
 
 
 def _get_all_simulation_files(sim_dir, file_base):
@@ -100,52 +99,6 @@ def particles_to_grid(sim_dir, file_base, grid_file, N_cell=None, N_max_load=Non
         os.rename(_processed_file, grid_file)  # noqa: PTH104
 
 
-def _get_time(grid_file):
-    """
-    Read the scale factor of a grid file from its header.
-    """
-
-    with h5py.File(grid_file, "r") as f:
-        return f["Header"].attrs["Time"]
-
-
-def _get_growth_factor(a, cosmology_params):
-    """
-    Linear growth factor D(a) for a flat LCDM cosmology, up to a constant normalization.
-
-    Parameters:
-    ----------
-    a: float
-        Scale factor.
-    cosmology_params: dict
-        Cosmology parameters: Omega_m, Omega_L.
-
-    Returns:
-    -------
-    D: float
-        Linear growth factor.
-    """
-
-    return a * hyp2f1(
-        1 / 3,
-        1,
-        11 / 6,
-        -(a**3) * cosmology_params["Omega_L"] / cosmology_params["Omega_m"],
-    )
-
-
-def _get_scale_factor(z=None, a=None):
-    """
-    Return the scale factor from either a redshift or a scale factor. Exactly one must be given.
-    """
-
-    if (z is None) == (a is None):
-        _msg = "Give exactly one of a redshift or a scale factor."
-        raise ValueError(_msg)
-
-    return a if a is not None else 1 / (1 + z)
-
-
 def density_to_z_reion(
     density_grid_file,
     z_reion_grid_file,
@@ -212,13 +165,13 @@ def density_to_z_reion(
     _field.scale_field(1 / _rho_mean, -1)
 
     # Rescale to the mean reionization redshift, deconvolve CIC, smooth to pi cMpc and apply the bias
-    _a = _get_time(density_grid_file)
+    _a = get_grid_time(density_grid_file)
     _a_z_reion_mean = 1 / (1 + _z_reion_params["z_reion_mean"])
 
     _field.forward()
     _field.apply_filter(
-        scaler=_get_growth_factor(_a_z_reion_mean, _cosmology_params)
-        / _get_growth_factor(_a, _cosmology_params),
+        scaler=get_growth_factor(_a_z_reion_mean, _cosmology_params)
+        / get_growth_factor(_a, _cosmology_params),
         smoothing_scale=np.pi,
         bias_params=_z_reion_params,
     )
@@ -236,115 +189,6 @@ def density_to_z_reion(
             "NumCells": np.int32(_field.N_cell),
             "CellSize": np.float64(_field.cell_size),
             **_z_reion_params,
-        },
-        N_slab=N_slab,
-    )
-
-
-def density_to_redshift(
-    density_grid_file,
-    output_grid_file,
-    z_target=None,
-    a_target=None,
-    z_source=None,
-    a_source=None,
-    grid_params=None,
-    cosmology_params=None,
-    smoothing_scale=np.pi,
-    fftw_effort="FFTW_ESTIMATE",
-    double_precision=True,
-    N_slab=64,
-):
-    """
-    Rescale a density grid from one redshift to another with linear theory, delta(k, a_target) = D(a_target) / D(a_source) * delta(k, a_source), optionally deconvolving the CIC assignment and re-smoothing at smoothing_scale, and write the result as a density grid at the target time. Works in place on a single padded buffer.
-
-    Without smoothing (smoothing_scale=None, or not larger than the cell size) the filter is a constant, so the rescaling is done directly in real space and no Fourier transform is run.
-
-    Note: linear rescaling of a nonlinear field is approximate on small scales, and growing a field (D(a_target) > D(a_source)) can produce negative densities where delta < -1 / scaler.
-
-    Parameters:
-    ----------
-    density_grid_file: str or Path
-        Path to the HDF5 density grid file.
-    output_grid_file: str or Path
-        Path to the output HDF5 density grid file.
-    z_target, a_target: float
-        Target redshift or scale factor. Give exactly one.
-    z_source, a_source: float, optional
-        Source redshift or scale factor. If neither is given, it is read from the header "Time" of the density grid file.
-    grid_params: dict, optional
-        Grid parameters: box_size, N_cell.
-    cosmology_params: dict, optional
-        Cosmology parameters: Omega_m, Omega_L.
-    smoothing_scale: float, optional
-        Scale in cMpc to re-smooth to after deconvolving the CIC assignment. Default is pi. None for no deconvolution or smoothing.
-    fftw_effort: str, optional
-        Effort level for the FFTW planner. Default is "FFTW_ESTIMATE".
-    double_precision: bool, optional
-        Whether to work in float64 (True) or float32 (False). Default is True.
-    N_slab: int, optional
-        Number of x-planes read or written at a time. Default is 64.
-    """
-
-    _grid_params = {
-        "box_size": 500,
-        "N_cell": 320,
-        **(grid_params or {}),
-    }
-
-    _cosmology_params = {
-        "Omega_m": 0.3089,
-        "Omega_L": 0.6911,
-        **(cosmology_params or {}),
-    }
-
-    _a_target = _get_scale_factor(z_target, a_target)
-    _a_source = (
-        _get_time(density_grid_file)
-        if z_source is None and a_source is None
-        else _get_scale_factor(z_source, a_source)
-    )
-    _growth_factor_ratio = _get_growth_factor(
-        _a_target, _cosmology_params
-    ) / _get_growth_factor(_a_source, _cosmology_params)
-
-    _field = FourierField(
-        _grid_params["box_size"],
-        _grid_params["N_cell"],
-        double_precision=double_precision,
-        fftw_effort=fftw_effort,
-    )
-    _rho_mean = _field.load_field(density_grid_file, "DensityDM", N_slab=N_slab)
-
-    _use_kernel = smoothing_scale is not None and _field.cell_size < smoothing_scale
-
-    if _use_kernel:
-        # rho -> delta, filter in Fourier space, delta -> rho
-        _field.scale_field(1 / _rho_mean, -1)
-
-        _field.forward()
-        _field.apply_filter(
-            scaler=_growth_factor_ratio, smoothing_scale=smoothing_scale
-        )
-        _field.inverse()
-
-        _field.scale_field(_rho_mean, _rho_mean)
-    else:
-        # rho_mean * (1 + f * delta) = f * rho + rho_mean * (1 - f)
-        _field.scale_field(_growth_factor_ratio, _rho_mean * (1 - _growth_factor_ratio))
-
-    _field.save_field(
-        output_grid_file,
-        "DensityDM",
-        header={
-            "BoxSize": np.float64(_field.box_size),
-            "NumCells": np.int32(_field.N_cell),
-            "CellSize": np.float64(_field.cell_size),
-            "Time": np.float64(_a_target),
-            "Redshift": np.float64(1 / _a_target - 1),
-            "SourceTime": np.float64(_a_source),
-            "GrowthFactorRatio": np.float64(_growth_factor_ratio),
-            "SmoothingScale": np.float64(smoothing_scale if _use_kernel else 0.0),
         },
         N_slab=N_slab,
     )

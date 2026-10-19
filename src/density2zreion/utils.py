@@ -3,6 +3,7 @@ import os
 import h5py
 import numpy as np
 from scipy.interpolate import CubicSpline
+from scipy.special import hyp2f1
 
 
 def get_interp(x_bins, y_bins):
@@ -51,3 +52,37 @@ def load_or_compute(save_file, datasets, func, *args, **kwargs):
                 _f.create_dataset(_field_name, data=_data, dtype=_dtype)
 
     return out
+
+
+def get_grid_time(grid_file):
+    """
+    Read the scale factor of a grid file from its header.
+    """
+
+    with h5py.File(grid_file, "r") as f:
+        return f["Header"].attrs["Time"]
+
+
+def get_growth_factor(a, cosmology_params):
+    """
+    Linear growth factor D(a) for a flat LCDM cosmology, up to a constant normalization.
+
+    Parameters:
+    ----------
+    a: float
+        Scale factor.
+    cosmology_params: dict
+        Cosmology parameters: Omega_m, Omega_L.
+
+    Returns:
+    -------
+    D: float
+        Linear growth factor.
+    """
+
+    return a * hyp2f1(
+        1 / 3,
+        1,
+        11 / 6,
+        -(a**3) * cosmology_params["Omega_L"] / cosmology_params["Omega_m"],
+    )
