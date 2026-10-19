@@ -1,9 +1,15 @@
+import os
+
 import h5py
 import numpy as np
 from tqdm import tqdm
 
 from density2zreion.fourier import FourierField
-from density2zreion.utils import get_grid_time, get_growth_factor
+from density2zreion.utils import (
+    check_file_exists,
+    get_grid_time,
+    get_growth_factor,
+)
 
 
 def density_to_smoothed_overdensity(
@@ -105,6 +111,78 @@ def get_brightness_temperature_amplitude(z, cosmology_params=None):
     )
 
 
+def _read_21cm_results(output_file):
+    """
+    Read previously calculated redshifts from the output file, if it exists.
+
+    Returns:
+    -------
+    k: 1D array or None
+        Centers of the k bins.
+    results: dict
+        Results per redshift (rounded to 6 decimals): P_k, P_k_err, x_HI_mean, T_b_mean.
+    """
+
+    if not check_file_exists(output_file):
+        return None, {}
+
+    with h5py.File(output_file, "r") as f:
+        k = f["WaveNumber"][:]
+        results = {
+            round(float(z), 6): {
+                "P_k": P_k,
+                "P_k_err": P_k_err,
+                "x_HI_mean": x_HI_mean,
+                "T_b_mean": T_b_mean,
+            }
+            for z, P_k, P_k_err, x_HI_mean, T_b_mean in zip(
+                f["Redshift"][:],
+                f["PowerSpectrum"][:],
+                f["PowerSpectrumError"][:],
+                f["NeutralFraction"][:],
+                f["MeanBrightnessTemperature"][:],
+                strict=True,
+            )
+        }
+
+    return k, results
+
+
+def _save_21cm_results(output_file, k, results, header):
+    """
+    Save the results of all calculated redshifts, sorted by redshift. The file is written to a temporary name and then renamed, so an interrupted write never corrupts the existing results.
+    """
+
+    _redshifts = sorted(results)
+    _tmp_file = f"{output_file}.tmp"
+
+    with h5py.File(_tmp_file, "w") as f:
+        _header = f.create_group("Header")
+        for _key, _value in header.items():
+            _header.attrs[_key] = _value
+
+        _P_k = np.array([results[z]["P_k"] for z in _redshifts])
+
+        f.create_dataset("Redshift", data=_redshifts)
+        f.create_dataset("WaveNumber", data=k)
+        f.create_dataset("PowerSpectrum", data=_P_k)
+        f.create_dataset(
+            "PowerSpectrumError", data=[results[z]["P_k_err"] for z in _redshifts]
+        )
+        f.create_dataset(
+            "DimensionlessPowerSpectrum", data=_P_k * k**3 / (2 * np.pi**2)
+        )
+        f.create_dataset(
+            "NeutralFraction", data=[results[z]["x_HI_mean"] for z in _redshifts]
+        )
+        f.create_dataset(
+            "MeanBrightnessTemperature",
+            data=[results[z]["T_b_mean"] for z in _redshifts],
+        )
+
+    os.replace(_tmp_file, output_file)  # noqa: PTH105
+
+
 def get_21cm_power_spectrum(
     smoothed_grid_file,
     z_reion_grid_file,
@@ -124,6 +202,8 @@ def get_21cm_power_spectrum(
 
     i.e. a cell is neutral until the universe reaches its reionization redshift. The buffer is allocated once and reused for every redshift; each redshift reads the two grid files once and runs one forward FFT. Peak memory is about one N_cell^3 array.
 
+    If output_file is given and exists, redshifts already in it are read back instead of recalculated. The file is updated after every new redshift, so an interrupted run keeps the redshifts it finished. The settings are not checked against the file, so use a new output_file when changing any parameter.
+
     Parameters:
     ----------
     smoothed_grid_file: str or Path
@@ -139,7 +219,7 @@ def get_21cm_power_spectrum(
     n_k_bins: int, optional
         Number of logarithmic k bin edges; there are n_k_bins - 1 bins. Default is 201.
     output_file: str or Path, optional
-        If given, also save the results to this HDF5 file.
+        If given, the HDF5 file the results are saved to and read back from.
     fftw_effort: str, optional
         Effort level for the FFTW planner. Default is "FFTW_ESTIMATE".
     double_precision: bool, optional
@@ -150,6 +230,7 @@ def get_21cm_power_spectrum(
     Returns:
     -------
     results: dict
+        For the requested redshifts, in the order given:
         redshift: 1D array, (n_z,)
             Redshifts.
         k: 1D array, (n_k_bins - 1,)
@@ -180,16 +261,31 @@ def get_21cm_power_spectrum(
         _N_cell = int(f["Header"].attrs["NumCells"])
         _a_snap = f["Header"].attrs["Time"]
 
-    _field = FourierField(
-        _box_size,
-        _N_cell,
-        double_precision=double_precision,
-        fftw_effort=fftw_effort,
-    )
+    _header = {
+        "BoxSize": np.float64(_box_size),
+        "NumCells": np.int32(_N_cell),
+        "RescaleDensity": rescale_density,
+        **_cosmology_params,
+    }
 
-    _P_k, _P_k_err, _x_HI_mean, _T_b_mean = [], [], [], []
+    # Previously calculated redshifts
+    k, _results = _read_21cm_results(output_file)
+
+    _field = None
 
     for _z in tqdm(_redshifts, desc="Redshifts"):
+        if round(float(_z), 6) in _results:
+            continue
+
+        # Allocate the buffer only once there is something to calculate
+        if _field is None:
+            _field = FourierField(
+                _box_size,
+                _N_cell,
+                double_precision=double_precision,
+                fftw_effort=fftw_effort,
+            )
+
         _growth_factor_ratio = (
             get_growth_factor(1 / (1 + _z), _cosmology_params)
             / get_growth_factor(_a_snap, _cosmology_params)
@@ -223,37 +319,25 @@ def get_21cm_power_spectrum(
         k, _P, _P_err = _field.get_power_spectrum(n_k_bins=n_k_bins)
 
         _T0 = get_brightness_temperature_amplitude(_z, _cosmology_params)
-        _P_k.append(_P * _T0**2)
-        _P_k_err.append(_P_err * _T0**2)
-        _x_HI_mean.append(_sums["x_HI"] / _N_cell**3)
-        _T_b_mean.append(_T0 * _sums["x_HI_rho"] / _N_cell**3)
+        _results[round(float(_z), 6)] = {
+            "P_k": _P * _T0**2,
+            "P_k_err": _P_err * _T0**2,
+            "x_HI_mean": _sums["x_HI"] / _N_cell**3,
+            "T_b_mean": _T0 * _sums["x_HI_rho"] / _N_cell**3,
+        }
+
+        # Save after every redshift, so an interrupted run keeps what it finished
+        if output_file is not None:
+            _save_21cm_results(output_file, k, _results, _header)
+
+    # Requested redshifts, in the order given
+    _rows = [_results[round(float(_z), 6)] for _z in _redshifts]
 
     results = {
         "redshift": _redshifts,
         "k": k,
-        "P_k": np.array(_P_k),
-        "P_k_err": np.array(_P_k_err),
-        "Delta2_k": np.array(_P_k) * k**3 / (2 * np.pi**2),
-        "x_HI_mean": np.array(_x_HI_mean),
-        "T_b_mean": np.array(_T_b_mean),
+        **{_key: np.array([_row[_key] for _row in _rows]) for _key in _rows[0]},
     }
-
-    if output_file is not None:
-        with h5py.File(output_file, "w") as f:
-            _header = f.create_group("Header")
-
-            _header.attrs.create("BoxSize", _box_size, dtype=np.float64)
-            _header.attrs.create("NumCells", _N_cell, dtype=np.int32)
-            _header.attrs.create("RescaleDensity", rescale_density)
-            for _key, _value in _cosmology_params.items():
-                _header.attrs[_key] = _value
-
-            f.create_dataset("Redshift", data=results["redshift"])
-            f.create_dataset("WaveNumber", data=results["k"])
-            f.create_dataset("PowerSpectrum", data=results["P_k"])
-            f.create_dataset("PowerSpectrumError", data=results["P_k_err"])
-            f.create_dataset("DimensionlessPowerSpectrum", data=results["Delta2_k"])
-            f.create_dataset("NeutralFraction", data=results["x_HI_mean"])
-            f.create_dataset("MeanBrightnessTemperature", data=results["T_b_mean"])
+    results["Delta2_k"] = results["P_k"] * k**3 / (2 * np.pi**2)
 
     return results
