@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.special import hyp2f1
+from tqdm import tqdm
 
 
 def get_interp(x_bins, y_bins):
@@ -86,3 +87,43 @@ def get_growth_factor(a, cosmology_params):
         11 / 6,
         -(a**3) * cosmology_params["Omega_L"] / cosmology_params["Omega_m"],
     )
+
+
+def get_grid_histogram(
+    grid_file,
+    dataset_name,
+    bins,
+    N_slab=64,
+):
+    """
+    np.histogram of a gridded field, read slab by slab so the full grid is never in memory. Gives the same result as np.histogram(grid, bins=bins, range=value_range, density=density).
+
+    Parameters:
+    ----------
+    grid_file: str or Path
+        Path to the HDF5 grid file.
+    dataset_name: str
+        Name of the dataset.
+    bins: array
+        The bin edges.
+    N_slab: int, optional
+        Number of x-planes read at a time. Default is 64.
+
+    Returns:
+    -------
+    hist: 1D array
+        Counts (or density) in each bin.
+    bin_edges: 1D array
+        Bin edges.
+    """
+
+    hist = np.zeros(bins, dtype=np.int64)
+
+    with h5py.File(grid_file, "r") as f:
+        _dset = f[dataset_name]
+        for i in tqdm(
+            range(0, _dset.shape[0], N_slab), desc=f"Histogram of {dataset_name}"
+        ):
+            hist += np.histogram(_dset[i : i + N_slab], bins=bins)[0]
+
+    return hist
