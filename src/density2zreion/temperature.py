@@ -12,9 +12,12 @@ from density2zreion.utils import (
 )
 
 
-def density_to_smoothed_overdensity(
-    density_grid_file,
+def field_to_smoothed_field(
+    grid_file,
     smoothed_grid_file,
+    field_name,
+    smoothed_field_name,
+    deviation=True,
     grid_params=None,
     smoothing_scale=np.pi,
     fftw_effort="FFTW_ESTIMATE",
@@ -22,14 +25,22 @@ def density_to_smoothed_overdensity(
     N_slab=64,
 ):
     """
-    Convert a density grid to an overdensity grid, deconvolving the CIC assignment and re-smoothing at smoothing_scale (if the cell size is smaller than it), and save it. This is the density field entering the 21cm brightness temperature, on the same smoothing scale as the reionization redshift field. Works in place on a single padded buffer.
+    Smooth a gridded field, deconvolving the CIC assignment and re-smoothing at smoothing_scale (if the cell size is smaller than it), and save it, either as the deviation from the mean, field / mean - 1 (e.g. the overdensity entering the 21cm brightness temperature), or as the field itself (e.g. a temperature). Works in place on a single padded buffer.
+
+    The filter leaves the k = 0 mode unchanged, so the smoothed field and the smoothed deviation carry the same information: field = mean * (1 + deviation).
 
     Parameters:
     ----------
-    density_grid_file: str or Path
-        Path to the HDF5 density grid file.
+    grid_file: str or Path
+        Path to the HDF5 grid file.
     smoothed_grid_file: str or Path
-        Path to the output HDF5 file. The overdensity is saved as "OverDensityDM", with the box size, number of cells, cell size, scale factor of the snapshot, mean density and smoothing scale in the header.
+        Path to the output HDF5 file. The smoothed field is saved as smoothed_field_name, with the box size, number of cells, cell size, scale factor of the snapshot, mean of the field ("MeanDensity"), smoothing scale and whether it is a deviation ("Deviation") in the header.
+    field_name: str
+        Name of the field in grid_file to read.
+    smoothed_field_name: str
+        Name of the field in smoothed_grid_file to write.
+    deviation: bool, optional
+        Whether to save the smoothed deviation field / mean - 1 (True) or the smoothed field itself (False). Default is True.
     grid_params: dict, optional
         Grid parameters: box_size, N_cell.
     smoothing_scale: float, optional
@@ -55,9 +66,10 @@ def density_to_smoothed_overdensity(
         fftw_effort=fftw_effort,
     )
 
-    # Load the density grid and convert it to overdensity
-    _rho_mean = _field.load_field(density_grid_file, "DensityDM", N_slab=N_slab)
-    _field.scale_field(1 / _rho_mean, -1)
+    # Load the field, and convert it to the deviation from the mean if asked
+    _mean = _field.load_field(grid_file, field_name, N_slab=N_slab)
+    if deviation:
+        _field.scale_field(1 / _mean, -1)
 
     # Deconvolve CIC and smooth to smoothing_scale
     _field.forward()
@@ -66,14 +78,15 @@ def density_to_smoothed_overdensity(
 
     _field.save_field(
         smoothed_grid_file,
-        "OverDensityDM",
+        smoothed_field_name,
         header={
             "BoxSize": np.float64(_field.box_size),
             "NumCells": np.int32(_field.N_cell),
             "CellSize": np.float64(_field.cell_size),
-            "Time": np.float64(get_grid_time(density_grid_file)),
-            "MeanDensity": np.float64(_rho_mean),
+            "Time": np.float64(get_grid_time(grid_file)),
+            "MeanDensity": np.float64(_mean),
             "SmoothingScale": np.float64(smoothing_scale),
+            "Deviation": deviation,
         },
         N_slab=N_slab,
     )
@@ -81,7 +94,7 @@ def density_to_smoothed_overdensity(
 
 def get_brightness_temperature_amplitude(z, cosmology_params=None):
     """
-    Amplitude T0(z) of the 21cm differential brightness temperature, delta T_b = T0(z) x_HI (1 + delta), in mK (Furlanetto, Oh & Briggs 2006), assuming the spin temperature is much larger than the CMB temperature and neglecting redshift-space distortions.
+    Amplitude T0(z) of the 21cm differential brightness temperature, delta T_b = T0(z) x_HI (1 + delta) (1 - T_gamma(z) / T_S), in mK (Furlanetto 2006, MNRAS 371, 867, Eq. 1; derived in Furlanetto, Oh & Briggs 2006, Eqs. 17-18), neglecting redshift-space distortions.
 
     Parameters:
     ----------
@@ -189,6 +202,8 @@ def get_21cm_power_spectrum(
     redshifts,
     cosmology_params=None,
     rescale_density=True,
+    temperature_grid_file=None,
+    temperature_field_name="Temperature",
     n_k_bins=201,
     output_file=None,
     fftw_effort="FFTW_ESTIMATE",
@@ -198,9 +213,9 @@ def get_21cm_power_spectrum(
     """
     Calculate the 21cm power spectrum at each redshift z from the smoothed overdensity and the reionization redshift field, with
 
-        delta T_b(x, z) = T0(z) x_HI(x, z) (1 + delta(x, z)),    x_HI = 1 if z_reion(x) < z else 0,
+        delta T_b(x, z) = T0(z) x_HI(x, z) (1 + delta(x, z)) (1 - T_gamma(z) / T_S(x)),    x_HI = 1 if z_reion(x) < z else 0,
 
-    i.e. a cell is neutral until the universe reaches its reionization redshift. The buffer is allocated once and reused for every redshift; each redshift reads the two grid files once and runs one forward FFT. Peak memory is about one N_cell^3 array.
+    i.e. a cell is neutral until the universe reaches its reionization redshift. T_gamma(z) = T_CMB0 (1 + z) is the CMB temperature at the redshift of emission. The spin temperature T_S is read from temperature_grid_file, assuming the Lyman-alpha coupling is saturated so that T_S equals the gas temperature; without it, T_S >> T_gamma is assumed and the last factor is 1. With T_S < T_gamma the signal is in absorption (negative). The buffer is allocated once and reused for every redshift; each redshift reads the two grid files once and runs one forward FFT. Peak memory is about one N_cell^3 array.
 
     If output_file is given and exists, redshifts already in it are read back instead of recalculated. The file is updated after every new redshift, so an interrupted run keeps the redshifts it finished. The settings are not checked against the file, so use a new output_file when changing any parameter.
 
@@ -213,9 +228,13 @@ def get_21cm_power_spectrum(
     redshifts: float or 1D array
         Redshift(s) at which to calculate the power spectrum.
     cosmology_params: dict, optional
-        Cosmology parameters: Omega_m, Omega_L, Omega_b, h. Default is the Planck 2015 cosmology used by IllustrisTNG / MTNG.
+        Cosmology parameters: Omega_m, Omega_L, Omega_b, h, T_CMB0 (in K). Default is the Planck 2015 cosmology used by IllustrisTNG / MTNG, with T_CMB0 = 2.7255 K.
     rescale_density: bool, optional
         Whether to rescale the overdensity from the snapshot to each redshift with the linear growth factor, delta(z) = D(z) / D(z_snap) delta(z_snap), as done for the reionization redshift field. Default is True.
+    temperature_grid_file: str or Path, optional
+        HDF5 file with the spin (gas) temperature in K on the same grid: the raw temperature, or the output of field_to_smoothed_field_deviation, either the smoothed temperature (deviation=False) or the smoothed deviation T / T_mean - 1 (deviation=True), told apart by its "Deviation" header attribute. The same temperature is used at every redshift. Default is None (T_S >> T_gamma).
+    temperature_field_name: str, optional
+        Name of the temperature dataset. Default is "Temperature".
     n_k_bins: int, optional
         Number of logarithmic k bin edges; there are n_k_bins - 1 bins. Default is 201.
     output_file: str or Path, optional
@@ -252,6 +271,7 @@ def get_21cm_power_spectrum(
         "Omega_L": 0.6911,
         "Omega_b": 0.0486,
         "h": 0.6774,
+        "T_CMB0": 2.7255,
         **(cosmology_params or {}),
     }
     _redshifts = np.atleast_1d(np.asarray(redshifts, dtype=np.float64))
@@ -261,10 +281,20 @@ def get_21cm_power_spectrum(
         _N_cell = int(f["Header"].attrs["NumCells"])
         _a_snap = f["Header"].attrs["Time"]
 
+    # T = T_mean (1 + deviation) for a smoothed deviation file, T itself otherwise.
+    # Files without the "Deviation" flag but with "MeanDensity" are deviations.
+    _T_mean = None
+    if temperature_grid_file is not None:
+        with h5py.File(temperature_grid_file, "r") as f:
+            _attrs = f["Header"].attrs if "Header" in f else {}
+            if _attrs.get("Deviation", "MeanDensity" in _attrs):
+                _T_mean = _attrs["MeanDensity"]
+
     _header = {
         "BoxSize": np.float64(_box_size),
         "NumCells": np.int32(_N_cell),
         "RescaleDensity": rescale_density,
+        "SpinTemperature": temperature_grid_file is not None,
         **_cosmology_params,
     }
 
@@ -292,21 +322,36 @@ def get_21cm_power_spectrum(
             if rescale_density
             else 1.0
         )
+        _T_gamma = _cosmology_params["T_CMB0"] * (1 + _z)
         _sums = {"x_HI": 0, "x_HI_rho": 0.0}
 
-        def _get_neutral_density(
-            delta, z_reion, z=_z, f=_growth_factor_ratio, sums=_sums
-        ):
+        def _get_spin_temperature_factor(rho, T, T_gamma=_T_gamma):
+            _T_S = T if _T_mean is None else _T_mean * (1 + T)
+            return rho * (1 - T_gamma / _T_S)
+
+        def _get_neutral_density(rho, z_reion, z=_z, sums=_sums):
             _x_HI = z_reion < z
-            _out = _x_HI * (1 + f * delta)
+            _out = _x_HI * rho
 
             sums["x_HI"] += np.count_nonzero(_x_HI)
             sums["x_HI_rho"] += np.sum(_out, dtype=np.float64)
 
             return _out
 
-        # x_HI (1 + delta) in real space
+        # (1 + delta) in real space
         _field.load_field(smoothed_grid_file, "OverDensityDM", N_slab=N_slab)
+        _field.scale_field(_growth_factor_ratio, 1.0)
+
+        # (1 - T_gamma / T_S), if a temperature file is given
+        if temperature_grid_file is not None:
+            _field.combine_with_file(
+                temperature_grid_file,
+                temperature_field_name,
+                _get_spin_temperature_factor,
+                N_slab=N_slab,
+            )
+
+        # x_HI
         _field.combine_with_file(
             z_reion_grid_file,
             "ReionizationRedshift",
