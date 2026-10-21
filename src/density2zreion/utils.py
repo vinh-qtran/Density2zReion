@@ -61,7 +61,7 @@ def get_grid_time(grid_file):
     """
 
     with h5py.File(grid_file, "r") as f:
-        return f["Header"].attrs["Time"]
+        return f["Header"].attrs.get("Time", None)
 
 
 def get_growth_factor(a, cosmology_params):
